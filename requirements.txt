@@ -1,0 +1,8 @@
+PySide6>=6.7,<7
+opencv-python>=4.10,<5
+numpy>=1.26,<3
+# Windows 摄像头能力枚举，包内自带 FFmpeg；实际采集仍使用 OpenCV。
+imageio-ffmpeg>=0.6,<1
+
+# PyTorch 2.8.0 + CUDA 12.8 is expected to be installed separately.
+# TensorRT is optional and only needed for trt16/trt8 modes.

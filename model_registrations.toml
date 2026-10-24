@@ -1,0 +1,45 @@
+# 可选的集中模型注册文件，使用 Python 3.12 自带的 TOML 解析器，无需安装依赖。
+# 普通模型只需让 models/ 中的文件名与主网络类名一致，无需填写此文件。
+# 修改后在桌面程序中点击“刷新”；删除本文件也不会影响同名自动识别。
+#
+# 规则：显式注册覆盖对应文件的自动识别；未注册的文件继续自动识别。
+# 表名是界面模型名，也是权重文件的模型名前缀；file 相对于 models/。
+# 省略 file 时使用“注册名.py”；省略 class_name 时选择与文件同名的类；
+# 省略 init_kwargs 时采用默认构造。
+# requires_weights 省略时沿用模型文件中的 REQUIRE_WEIGHTS，未声明时为 true。
+# 输出范围优先级：单个模型的 output_range > 模型 OUTPUT_RANGE > [defaults]。
+# 未设置 [defaults].output_range 时使用内置默认值 "0_1"，无需逐个注册普通模型。
+# 范围在模型识别时确定；少量越界值只裁剪，不会逐帧猜测或切换范围。
+# 旧的 "auto" 固定使用全局默认值，并对相同来源与默认值在每次程序运行中提示一次。
+# 注册项内容错误会明确报告，已定位的对应文件不会再自动注册。
+# 整个文件语法错误时报告错误，并继续自动识别；请修正后再运行特殊模型。
+#
+# 以下均为虚构示例，取消注释并填写实际文件、类名和训练参数后生效：
+#
+# [models.ExampleNet]
+# file = "ExampleNet.py"
+# class_name = "ExampleNet"
+# init_kwargs = { channels = 64, num_blocks = 4 }
+# requires_weights = true
+# output_range = "0_1"
+#
+# 文件名与类名不同，或需要将同一文件中的网络注册为另一个名称时：
+# [models.ExampleNet_Variant]
+# file = "LegacyExample.py"
+# class_name = "AlternativeExample"
+# init_kwargs = { channels = 32 }
+# requires_weights = true
+# output_range = "0_1"
+
+[defaults]
+output_range = "0_1"
+
+[models]
+
+# 虚构示例：输出采用 [-1,1] 的模型，仅需覆盖这一项：
+# [models.ExampleSignedNet]
+# output_range = "minus1_1"
+#
+# 虚构示例：输出采用 [0,255] 的模型：
+# [models.ExampleByteNet]
+# output_range = "0_255"
