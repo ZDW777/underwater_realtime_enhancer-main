@@ -12,6 +12,8 @@ RESOLUTIONS: dict[str, tuple[str, int, int]] = {
     "1920x1080": ("1920 × 1080（Full HD）", 1920, 1080),
     "1280x720": ("1280 × 720（HD）", 1280, 720),
     "other": ("其他 / 自定义", 0, 0),
+    # 原尺寸在读取每个媒体文件后确定，不用 0x0 解析 TensorRT 权重目录。
+    "auto": ("自动匹配", 0, 0),
 }
 
 BACKENDS = {
@@ -45,3 +47,8 @@ class RunConfig:
     def weight_resolution_key(self) -> str:
         """返回权重目录与文件名统一使用的具体分辨率字段。"""
         return f"{self.width}x{self.height}"
+
+    @property
+    def auto_match(self) -> bool:
+        """自动匹配仅用于 PyTorch 图像/视频，后端逐帧保留源尺寸。"""
+        return self.resolution_key == "auto"

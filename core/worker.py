@@ -19,10 +19,8 @@ from config import RunConfig
 from core.backends import create_backend
 from core.camera import CameraCaptureError, CameraInfo, LatestFrameCapture, invalidate_camera_cache, open_camera
 from core.model_registry import ModelSpec
+from core.media import IMAGE_EXTENSIONS, MediaInputError, create_video_writer, folder_media
 from core.weight_resolver import WeightResolver
-
-
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
 class InferenceWorker(QThread):
@@ -38,6 +36,10 @@ class InferenceWorker(QThread):
     output_saved = Signal(str)
     camera_info = Signal(object)
     camera_frame_available = Signal()
+    # 文件夹逐项切换使用握手，防止上一视频的定时器消费下一项的队列。
+    media_started = Signal(str, str, int, int)
+    media_skipped = Signal(str)
+    processing_size_changed = Signal(int, int)
 
     VIDEO_PREBUFFER_FRAMES = 30
     METRIC_WINDOW = 60
@@ -68,6 +70,24 @@ class InferenceWorker(QThread):
         self._inference_samples: deque[float] = deque(maxlen=self.METRIC_WINDOW)
         self._processing_samples: deque[float] = deque(maxlen=self.METRIC_WINDOW)
         self._source_fps = 30.0
+        self._item_ack = threading.Event()
+        self._image_ack = threading.Event()
+
+    def acknowledge_item(self) -> None:
+        """主线程完成逐项播放状态重置后，允许后台开始读取下一文件。"""
+        self._item_ack.set()
+
+    def acknowledge_image(self) -> None:
+        """主线程已复制图像预览，文件夹可以继续，避免堆积大图信号。"""
+        self._image_ack.set()
+
+    def _wait_for_ack(self, event: threading.Event) -> None:
+        """握手等待可以被停止打断；暂停仍通过现有Condition控制。"""
+        while not event.wait(0.1):
+            if self._stop_event.is_set():
+                raise InterruptedError("已结束文件夹处理")
+        if self._stop_event.is_set():
+            raise InterruptedError("已结束文件夹处理")
 
     def request_pause(self, paused: bool) -> None:
         """设置暂停状态；Condition 可避免暂停时持续占用 CPU。"""
@@ -104,13 +124,27 @@ class InferenceWorker(QThread):
             while self._paused and not self._stop_event.is_set():
                 self._pause_condition.wait(timeout=0.2)
 
-    def _output_path(self, suffix: str) -> Path | None:
-        """按时间戳创建不会覆盖旧结果的输出路径。"""
+    def _output_path(self, suffix: str, source: str | int | None = None) -> Path | None:
+        """媒体文件保留原名称，视频保持MP4格式；无源文件名的摄像头使用时间戳。"""
         if not self.config.save_output or self.config.output_dir is None:
             return None
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
+        if source is not None and self.config.source_kind != "camera":
+            # 单文件和文件夹使用相同命名，不附加enhanced、日期或唯一后缀。
+            # 图像保留原扩展名；视频保留主文件名，沿用原有MP4输出格式。
+            original = Path(str(source))
+            name = (original.name if suffix == ".png" or original.suffix.lower() == suffix
+                    else original.with_suffix(suffix).name)
+            output = self.config.output_dir / name
+            # 保持原先“保存不会覆盖输入”的行为，包含符号链接/硬链接情况。
+            if (output.resolve() == original.resolve()
+                    or (output.exists() and output.samefile(original))):
+                raise ValueError("输出文件与原文件是同一文件，请选择不同的输出目录，避免覆盖原文件")
+            return output
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        return self.config.output_dir / f"enhanced_{stamp}{suffix}"
+        # 摄像头没有原文件名，保持原有时间戳规则。
+        unique = time.time_ns() % 1_000_000_000
+        return self.config.output_dir / f"enhanced_{stamp}_{unique:09d}{suffix}"
 
     def take_preview_frame(self) -> tuple[np.ndarray, np.ndarray] | None:
         """Qt定时器或相机唤醒槽取出同步预览；空缓冲区立即返回。"""
@@ -243,11 +277,30 @@ class InferenceWorker(QThread):
                 self._preview_condition.wait(timeout=0.1)
 
     def run(self) -> None:
-        """在线程内部创建 CUDA 后端，依次处理图像或视频帧。"""
+        """在同一工作线程创建后端，文件夹按固定清单顺序处理并复用模型。"""
         backend = None
-        capture = None
-        writer = None
         try:
+            if self.config.auto_match and (self.config.backend != "pytorch" or self.config.source_kind == "camera"):
+                raise ValueError("自动匹配仅支持PyTorch图像、视频或文件夹；摄像头请选择固定尺寸")
+            is_folder = self.config.source_kind == "folder"
+            if is_folder:
+                items = folder_media(Path(str(self.config.source)))
+                if not items:
+                    raise MediaInputError("文件夹当前目录中没有支持的图像或视频")
+            else:
+                items = [(self.config.source, self.config.source_kind)]
+            if is_folder and self.config.save_output and self.config.output_dir is not None:
+                # AVI/MP4等同主名输入会映射到同一个MP4，先检查整批，
+                # 不加后缀也不能让后一个来源静默覆盖前一个来源的结果。
+                planned: dict[Path, Path] = {}
+                for source, kind in items:
+                    output = self._output_path(".png" if kind == "image" else ".mp4", str(source))
+                    if output in planned:
+                        raise ValueError(
+                            f"文件夹中 {planned[output].name} 与 {Path(source).name} 的输出文件名均为 {output.name}，"
+                            "请分开处理或调整源文件名，避免结果互相覆盖"
+                        )
+                    planned[output] = Path(source)
             resolver = WeightResolver(self.config.root / "weights")
             weight_path = resolver.resolve(
                 self.config.model_name,
@@ -260,64 +313,115 @@ class InferenceWorker(QThread):
                 weight_path,
                 self.config.width,
                 self.config.height,
+                auto_match=self.config.auto_match,
             )
-            if self.config.source_kind == "image":
+            succeeded, skipped = 0, 0
+            for index, (source, kind) in enumerate(items, 1):
+                self._wait_if_paused()
+                if self._stop_event.is_set():
+                    break
+                if is_folder:
+                    # 每项先由主线程停旧定时器、清显示计时，再开放生产；
+                    # 不同文件的FPS、预热和处理耗时不能混成同一个滑动窗口。
+                    with self._metrics_lock:
+                        self._inference_samples.clear()
+                        self._processing_samples.clear()
+                    self._item_ack.clear()
+                    self._source_fps = 30.0
+                    self.media_started.emit(str(source), kind, index, len(items))
+                    self._wait_for_ack(self._item_ack)
+                    self._wait_if_paused()
+                    if self._stop_event.is_set():
+                        break
+                try:
+                    self._process_media(backend, str(source) if kind != "camera" else source, kind, is_folder)
+                    succeeded += 1
+                except MediaInputError as exc:
+                    if not is_folder:
+                        raise
+                    skipped += 1
+                    self.media_skipped.emit(f"{Path(str(source)).name}：{exc}")
+            if self._stop_event.is_set():
+                self.state_changed.emit("已结束")
+            elif is_folder:
+                self.state_changed.emit(f"文件夹处理完成 · 成功{succeeded}项 · 跳过{skipped}项")
+            else:
+                self.state_changed.emit("图像处理完成" if self.config.source_kind == "image" else "视频处理完成")
+        except InterruptedError:
+            self.state_changed.emit("已结束")
+        except Exception as exc:
+            if isinstance(exc, CameraCaptureError):
+                # 模型/写盘异常不误删相机成功配置，采集故障才清缓存。
+                invalidate_camera_cache()
+            self.error.emit(f"{type(exc).__name__}: {exc}")
+            self.state_changed.emit("发生错误")
+        finally:
+            if backend is not None:
+                backend.close()
+
+    def _process_media(self, backend, source: str | int, source_kind: str, is_folder: bool) -> None:
+        """处理一个文件或相机；文件夹复用此路径，资源仍按媒体项及时释放。"""
+        capture, writer, output_path = None, None, None
+        try:
+            if source_kind == "image":
                 # imdecode + fromfile 可正确读取含中文字符的 Windows 路径。
-                raw = np.fromfile(str(self.config.source), dtype=np.uint8)
-                frame = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+                try:
+                    raw = np.fromfile(str(source), dtype=np.uint8)
+                except OSError as exc:
+                    raise MediaInputError(f"无法读取图像：{exc}") from exc
+                try:
+                    frame = cv2.imdecode(raw, cv2.IMREAD_COLOR) if raw.size else None
+                except cv2.error as exc:
+                    raise MediaInputError(f"无法解码所选图像：{exc}") from exc
                 if frame is None:
-                    raise RuntimeError("无法读取所选图像")
+                    raise MediaInputError("无法解码所选图像")
+                width, height = (frame.shape[1], frame.shape[0]) if self.config.auto_match else (self.config.width, self.config.height)
+                self.processing_size_changed.emit(width, height)
                 started = time.perf_counter()
                 enhanced, inference_ms = backend.infer(frame)
                 total_ms = (time.perf_counter() - started) * 1000.0
                 self._record_metrics(inference_ms, total_ms)
                 original_preview, enhanced_preview = self._make_preview_pair(frame, enhanced)
+                if is_folder:
+                    self._image_ack.clear()
                 self.frames_ready.emit(original_preview, enhanced_preview)
-                output_path = self._output_path(".png")
+                output_path = self._output_path(".png", source)
                 if output_path is not None:
-                    ok, encoded = cv2.imencode(".png", enhanced)
+                    # 名字与源文件一致时也按原扩展名编码，不能把PNG字节伪装成JPG。
+                    ok, encoded = cv2.imencode(output_path.suffix.lower(), enhanced)
                     if not ok:
                         raise RuntimeError(f"结果保存失败：{output_path}")
                     encoded.tofile(str(output_path))
                     self.output_saved.emit(str(output_path))
-                self.state_changed.emit("图像处理完成")
+                if is_folder:
+                    self._wait_for_ack(self._image_ack)
                 return
 
             first_frame = None
-            if self.config.source_kind == "camera":
+            if source_kind == "camera":
                 self.state_changed.emit("正在协商摄像头模式…")
                 capture, first_frame, source_fps = open_camera(
-                    int(self.config.source), self.config.width, self.config.height,
+                    int(source), self.config.width, self.config.height,
                     self._stop_event.is_set, self._report_camera_info,
                 )
             else:
-                capture = cv2.VideoCapture(self.config.source)
+                capture = cv2.VideoCapture(str(source))
                 source_fps = float(capture.get(cv2.CAP_PROP_FPS))
             if not capture.isOpened():
-                raise RuntimeError("无法打开视频或摄像头")
+                raise MediaInputError("无法打开视频或摄像头")
             if not np.isfinite(source_fps) or source_fps <= 0:
                 source_fps = 30.0
             self._source_fps = source_fps
-            if self.config.source_kind == "camera":
+            if source_kind == "camera":
                 # 从此处起由采集线程独占读取/释放；丢弃启动验证帧，等待最新帧。
                 capture = LatestFrameCapture(capture, self._stop_event.is_set, self.state_changed.emit)
                 self._camera_capture = capture
                 first_frame = None
-            output_path = self._output_path(".mp4")
-            if output_path is not None:
-                writer = cv2.VideoWriter(
-                    str(output_path),
-                    cv2.VideoWriter_fourcc(*"mp4v"),
-                    source_fps,
-                    (self.config.width, self.config.height),
-                )
-                if not writer.isOpened():
-                    raise RuntimeError(f"无法创建输出视频：{output_path}")
-
-            is_camera = self.config.source_kind == "camera"
+            is_camera = source_kind == "camera"
             playback_announced = False
             frame_number = 0
             camera_read_failures = 0
+            video_size = None
             warmup_frames = (
                 self.TENSORRT_WARMUP_FRAMES
                 if self.config.backend in ("trt16", "trt8")
@@ -356,9 +460,23 @@ class InferenceWorker(QThread):
                         continue
                     break
                 camera_read_failures = 0
+                if video_size is None:
+                    # 视频尺寸以第一张真实解码帧为准，不依赖可能失真的元数据。
+                    video_size = ((frame.shape[1], frame.shape[0]) if self.config.auto_match else
+                                  (self.config.width, self.config.height))
+                    self.processing_size_changed.emit(*video_size)
+                    output_path = self._output_path(".mp4", source)
+                    if output_path is not None:
+                        writer = create_video_writer(output_path, source_fps, *video_size, exact_size=self.config.auto_match)
+                        if not writer.isOpened():
+                            raise RuntimeError(f"无法创建输出视频：{output_path}")
+                elif self.config.auto_match and (frame.shape[1], frame.shape[0]) != video_size:
+                    raise ValueError("视频中途改变了帧尺寸，无法写入固定尺寸视频，请先拆分该视频")
                 enhanced, inference_ms = backend.infer(frame)
                 if writer is not None:
                     # 保存路径始终接收完整分辨率增强结果，预览缩略图不会影响输出。
+                    if enhanced.shape[:2] != (video_size[1], video_size[0]):
+                        raise ValueError("模型输出尺寸与保存尺寸不一致，请检查网络输入约束")
                     writer.write(enhanced)
 
                 preview_pair = self._make_preview_pair(frame, enhanced)
@@ -388,6 +506,8 @@ class InferenceWorker(QThread):
                             self.playback_ready.emit(source_fps)
                             playback_announced = True
 
+            if frame_number == 0 and not self._stop_event.is_set():
+                raise MediaInputError("视频未解码到任何有效帧")
             # 短视频不足30帧时，在文件结束后也必须启动播放；普通视频则等待
             # 已经处理好的尾帧显示完毕，保证预览顺序完整。
             if not is_camera and not self._stop_event.is_set():
@@ -396,33 +516,28 @@ class InferenceWorker(QThread):
                 self._wait_for_preview_drain()
 
             if writer is not None:
-                writer.release()
-                writer = None
+                completed, writer = writer, None
+                completed.release()
             if output_path is not None and output_path.exists():
                 self.output_saved.emit(str(output_path))
-            self.state_changed.emit("已结束" if self._stop_event.is_set() else "视频处理完成")
         except InterruptedError:
             # “结束”可能恰好打断等待相机新帧；仍需完成已打开的视频文件并
             # 通知保存路径，避免只在finally释放却漏掉“结果已保存”的提示。
             if writer is not None:
-                writer.release()
-                writer = None
+                completed, writer = writer, None
+                completed.release()
                 if output_path is not None and output_path.exists():
                     self.output_saved.emit(str(output_path))
-            self.state_changed.emit("已结束")
-        except Exception as exc:
-            if isinstance(exc, CameraCaptureError):
-                # 运行期采集故障使缓存失效；用户下次开始时重新完整检测。
-                # 模型/写盘错误及正常暂停、结束不会清除已验证的相机配置。
-                invalidate_camera_cache()
-            self.error.emit(f"{type(exc).__name__}: {exc}")
-            self.state_changed.emit("发生错误")
+            raise
         finally:
             # 无论正常结束还是发生异常，都释放文件句柄和摄像头资源。
-            if writer is not None:
-                writer.release()
-            if capture is not None:
-                capture.release()
-            self._camera_capture = None
-            if backend is not None:
-                backend.close()
+            # 编码收尾本身也可能失败；嵌套finally确保读取器仍然被释放。
+            try:
+                if writer is not None:
+                    writer.release()
+            finally:
+                try:
+                    if capture is not None:
+                        capture.release()
+                finally:
+                    self._camera_capture = None

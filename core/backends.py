@@ -73,7 +73,7 @@ class InferenceBackend(ABC):
 
 class PyTorchBackend(InferenceBackend):
     """加载模型结构和 .pth checkpoint 的 CUDA 推理后端。"""
-    def __init__(self, model_spec: ModelSpec, weight_path: Path, width: int, height: int):
+    def __init__(self, model_spec: ModelSpec, weight_path: Path, width: int, height: int, auto_match: bool = False):
         import torch
 
         if not torch.cuda.is_available():
@@ -83,6 +83,8 @@ class PyTorchBackend(InferenceBackend):
         self.width = width
         self.height = height
         self.output_range = model_spec.output_range
+        self.auto_match = auto_match
+        self.input_multiple = model_spec.input_multiple
         self.model = model_spec.create().to(self.device).eval()
 
         # Passthrough 可跳过权重；真实增强模型默认必须加载 checkpoint。
@@ -114,11 +116,19 @@ class PyTorchBackend(InferenceBackend):
     def infer(self, bgr: np.ndarray) -> tuple[np.ndarray, float]:
         torch = self.torch
         # 相机已协商到目标尺寸时直接使用原帧，避免重复 resize 和内存复制。
-        resized = (bgr if bgr.shape[:2] == (self.height, self.width) else
+        resized = (bgr if self.auto_match or bgr.shape[:2] == (self.height, self.width) else
                    cv2.resize(bgr, (self.width, self.height), interpolation=cv2.INTER_AREA))
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         tensor = torch.from_numpy(np.ascontiguousarray(rgb)).to(self.device)
         tensor = tensor.permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
+
+        # 原尺寸不拉伸：只在右侧/底部复制边缘到网络要求的倍数，推理后裁掉
+        # 补边。640×377默认补到640×384，最终仍输出640×377。
+        source_h, source_w = resized.shape[:2]
+        pad_h = (-source_h) % self.input_multiple if self.auto_match else 0
+        pad_w = (-source_w) % self.input_multiple if self.auto_match else 0
+        if pad_h or pad_w:
+            tensor = torch.nn.functional.pad(tensor, (0, pad_w, 0, pad_h), mode="replicate")
 
         # CUDA Event 只统计 GPU 推理时间，预处理和后处理计入端到端耗时。
         with torch.inference_mode():
@@ -127,7 +137,15 @@ class PyTorchBackend(InferenceBackend):
             self.end_event.record()
             self.end_event.synchronize()
         inference_ms = float(self.start_event.elapsed_time(self.end_event))
-        return _to_uint8_bgr(output, self.output_range), inference_ms
+        enhanced = _to_uint8_bgr(output, self.output_range)
+        if self.auto_match:
+            if enhanced.shape[:2] != (source_h + pad_h, source_w + pad_w):
+                raise ValueError(
+                    f"自动匹配要求网络保持输入空间尺寸；补边输入为{source_w + pad_w}×{source_h + pad_h}，"
+                    f"实际输出为{enhanced.shape[1]}×{enhanced.shape[0]}，请检查模型或集中配置input_multiple"
+                )
+            enhanced = np.ascontiguousarray(enhanced[:source_h, :source_w])
+        return enhanced, inference_ms
 
 
 class TensorRTBackend(InferenceBackend):
@@ -304,10 +322,13 @@ def create_backend(
     weight_path: Path,
     width: int,
     height: int,
+    auto_match: bool = False,
 ) -> InferenceBackend:
     """根据界面模式创建相应后端，调用方无需关心具体实现。"""
     if backend_name == "pytorch":
-        return PyTorchBackend(model_spec, weight_path, width, height)
+        return PyTorchBackend(model_spec, weight_path, width, height, auto_match)
+    if auto_match:
+        raise ValueError("自动匹配仅支持PyTorch，TensorRT请使用与engine一致的固定尺寸")
     if backend_name in ("trt16", "trt8"):
         return TensorRTBackend(weight_path, width, height, model_spec.output_range)
     raise ValueError(f"未知推理模式：{backend_name}")

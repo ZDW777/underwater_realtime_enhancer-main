@@ -10,7 +10,7 @@ from pathlib import Path
 import time
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal, QSignalBlocker
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -24,6 +24,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -43,8 +44,12 @@ from PySide6.QtWidgets import (
 from config import BACKENDS, RESOLUTIONS, RunConfig
 from core.camera import CameraInfo
 from core.model_registry import ModelRegistry
+from core.media import media_kind
+from core.preferences import PreferencesStore, StartupPreferences
 from core.weight_resolver import WeightResolver
 from core.worker import IMAGE_EXTENSIONS, InferenceWorker
+from ui.settings_dialog import SettingsDialog
+from ui.source_dialog import SourceDialog
 
 
 class OceanHeader(QWidget):
@@ -244,7 +249,7 @@ class MetricCard(QFrame):
 class MainWindow(QMainWindow):
     """主窗口：组织输入、模型配置、实时画面、性能指标和运行控制。"""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, preferences_store: PreferencesStore | None = None):
         super().__init__()
         self.root = root
         self.registry = ModelRegistry(root / "models")
@@ -252,6 +257,11 @@ class MainWindow(QMainWindow):
         self.worker: InferenceWorker | None = None
         self.source: str | int | None = None
         self.source_kind: str | None = None
+        self.preferences_store = preferences_store if preferences_store is not None else PreferencesStore()
+        self._active_source_kind: str | None = None
+        self._resolved_auto_size: tuple[int, int] | None = None
+        self._last_fixed_resolution = "3840x2160"
+        self._batch_errors: list[str] = []
         # 自定义宽高只有在用户点击“确认尺寸”后才生效。输入过程中保持
         # None，防止每次 QSpinBox 数值变化都解析路径并创建临时目录。
         self._confirmed_custom_size: tuple[int, int] | None = None
@@ -280,6 +290,7 @@ class MainWindow(QMainWindow):
         self._metrics_timer.timeout.connect(self._show_metrics)
         self._apply_style()
         self.refresh_models()
+        self._apply_startup_preferences(self.preferences_store.load())
         self._update_resolution_controls()
         self._update_summary()
 
@@ -318,10 +329,10 @@ class MainWindow(QMainWindow):
         source_layout.setContentsMargins(14, 18, 14, 12)
         self.source_label = QLineEdit()
         self.source_label.setReadOnly(True)
-        self.source_label.setPlaceholderText("请选择图像、视频或摄像头")
+        self.source_label.setPlaceholderText("请选择图像、视频、文件夹或摄像头")
         source_layout.addWidget(self.source_label)
         source_buttons = QHBoxLayout()
-        self.open_file_button = QPushButton("▣  选择图像 / 视频")
+        self.open_file_button = QPushButton("▣  选择图像 / 视频 / 文件夹")
         self.camera_button = QPushButton("◉  使用摄像头 0")
         source_buttons.addWidget(self.open_file_button)
         source_buttons.addWidget(self.camera_button)
@@ -425,6 +436,10 @@ class MainWindow(QMainWindow):
         footer_layout.addWidget(self.start_button)
         footer_layout.addWidget(self.pause_button)
         footer_layout.addWidget(self.stop_button)
+        self.settings_button = QPushButton("⚙  设置")
+        self.settings_button.setObjectName("settingsButton")
+        self.settings_button.setToolTip("设置下次启动时的默认模型、推理模式和处理分辨率")
+        footer_layout.addWidget(self.settings_button)
         self.summary = QLabel()
         self.summary.setObjectName("summary")
         self.summary.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -438,7 +453,7 @@ class MainWindow(QMainWindow):
         self.resolution_combo.currentIndexChanged.connect(self._on_resolution_changed)
         self.confirm_size_button.clicked.connect(self._confirm_custom_resolution)
         self.model_combo.currentIndexChanged.connect(self._update_summary)
-        self.backend_combo.currentIndexChanged.connect(self._update_summary)
+        self.backend_combo.currentIndexChanged.connect(self._on_backend_changed)
         self.width_spin.valueChanged.connect(self._on_custom_size_edited)
         self.height_spin.valueChanged.connect(self._on_custom_size_edited)
         self.save_checkbox.toggled.connect(self.output_dir.setEnabled)
@@ -447,11 +462,13 @@ class MainWindow(QMainWindow):
         self.start_button.clicked.connect(self.start_processing)
         self.pause_button.clicked.connect(self.toggle_pause)
         self.stop_button.clicked.connect(self.stop_processing)
+        self.settings_button.clicked.connect(self._open_settings)
 
     def _apply_style(self) -> None:
         """集中设置深海蓝、青绿高光和清晰的控件层级。"""
         self.setStyleSheet("""
             QMainWindow { background: #06111d; }
+            QDialog { background: #0b1d2c; }
             QWidget { color: #dcecf4; font-size: 13px; font-family: "Microsoft YaHei UI", "Segoe UI"; }
             QWidget#central { background: #071522; }
             QLabel#title { color: #f4ffff; font-size: 24px; font-weight: 700; background: transparent; }
@@ -490,12 +507,68 @@ class MainWindow(QMainWindow):
             QPushButton#stopButton { background: #512d3b; border-color: #8b4a60; color: #f4dce5; min-width: 74px; }
             QPushButton#stopButton:hover { background: #6b3447; }
             QLabel#summary { color: #85aebb; font-size: 12px; padding-right: 4px; }
+            QLabel#settingsNote { color: #8eb8c6; font-size: 12px; }
+            QDialog QTreeView, QDialog QListView { background: #0a1927; alternate-background-color: #102b3d;
+                selection-background-color: #126778; border: 1px solid #285066; }
             QCheckBox { spacing: 8px; color: #b9d8e1; }
             QCheckBox::indicator { width: 16px; height: 16px; }
             QCheckBox::indicator:unchecked { background: #081722; border: 1px solid #31576b; border-radius: 3px; }
             QCheckBox::indicator:checked { background: #19a99a; border: 1px solid #50d9c8; border-radius: 3px; }
             QStatusBar { color: #81aeba; background: #06111d; }
         """)
+
+    def _apply_startup_preferences(self, preferences: StartupPreferences) -> None:
+        """扫描后恢复默认选项；暂时阻断联动，避免恢复中间态创建无效目录。"""
+        widgets = (self.model_combo, self.backend_combo, self.resolution_combo, self.width_spin, self.height_spin)
+        blockers = [QSignalBlocker(widget) for widget in widgets]
+        model_index = self.model_combo.findText(preferences.model_name)
+        if model_index >= 0:
+            self.model_combo.setCurrentIndex(model_index)
+        elif preferences.model_name:
+            self.statusBar().showMessage(f"默认模型 {preferences.model_name} 已不可用，已选择当前有效模型", 12000)
+        self.backend_combo.setCurrentIndex(self.backend_combo.findData(preferences.backend))
+        self.resolution_combo.setCurrentIndex(self.resolution_combo.findData(preferences.resolution_key))
+        self.width_spin.setValue(preferences.width)
+        self.height_spin.setValue(preferences.height)
+        self._confirmed_custom_size = ((preferences.width, preferences.height)
+                                       if preferences.resolution_key == "other" else None)
+        self._resolved_auto_size = None
+        if preferences.resolution_key != "auto":
+            self._last_fixed_resolution = preferences.resolution_key
+        del blockers
+        self._sync_auto_option()
+        self._update_resolution_controls()
+
+    def _open_settings(self) -> None:
+        """居中打开启动设置；保存成功后同时应用，取消保持原偏好。"""
+        current = StartupPreferences(
+            self.model_combo.currentText(), self.backend_combo.currentData(),
+            self.resolution_combo.currentData(), self.width_spin.value(), self.height_spin.value(),
+        )
+        dialog = SettingsDialog(list(self.registry.models), current, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        preferences = dialog.preferences()
+        try:
+            self.preferences_store.save(preferences)
+        except OSError as exc:
+            QMessageBox.critical(self, "设置保存失败", str(exc))
+            return
+        self._apply_startup_preferences(preferences)
+        self.statusBar().showMessage("启动设置已保存，下次启动将自动恢复", 8000)
+
+    def _sync_auto_option(self) -> None:
+        """自动匹配只开放给 PyTorch 文件输入；切换后端时回到上次固定选项。"""
+        allowed = self.backend_combo.currentData() == "pytorch" and self.source_kind != "camera"
+        item = self.resolution_combo.model().item(self.resolution_combo.findData("auto"))
+        item.setEnabled(allowed)
+        if not allowed and self.resolution_combo.currentData() == "auto":
+            self.resolution_combo.setCurrentIndex(self.resolution_combo.findData(self._last_fixed_resolution))
+            self.statusBar().showMessage("自动匹配用于PyTorch图像/视频；当前已切回固定尺寸", 8000)
+
+    def _on_backend_changed(self) -> None:
+        self._sync_auto_option()
+        self._update_summary()
 
     def refresh_models(self) -> None:
         """重新扫描 models 目录，并尽量保留用户之前选择的模型。"""
@@ -532,6 +605,9 @@ class MainWindow(QMainWindow):
     def _on_resolution_changed(self) -> None:
         """切换分辨率模式后使旧的自定义尺寸确认失效。"""
         self._confirmed_custom_size = None
+        self._resolved_auto_size = None
+        if self.resolution_combo.currentData() != "auto":
+            self._last_fixed_resolution = self.resolution_combo.currentData()
         self._update_resolution_controls()
 
     def _on_custom_size_edited(self) -> None:
@@ -561,6 +637,19 @@ class MainWindow(QMainWindow):
         backend_text = self.backend_combo.currentText()
         key, width, height = self._current_size()
         resolution = f"{width}x{height}"
+        if key == "auto":
+            # 不调用TensorRT路径解析，不创建0x0目录。尺寸由读取后的真实帧报告。
+            size_text = (f"{self._resolved_auto_size[0]}×{self._resolved_auto_size[1]}"
+                         if self._resolved_auto_size else "等待输入")
+            self.summary.setText(f"模型  {model}    ·    模式  {backend_text}    ·    输出  自动匹配（{size_text}）")
+            if self.backend_combo.currentData() != "pytorch":
+                self.weight_hint.setText("○ 自动匹配仅支持PyTorch，请切换推理模式或使用固定尺寸")
+                return
+            path = self.resolver.resolve(model, "auto", "pytorch")
+            spec = self.registry.models.get(model)
+            state = "✓ 无需权重" if spec and not spec.requires_weights else ("✓ 已找到" if path.is_file() else "○ 待放入")
+            self.weight_hint.setText(f"{state}    {path.relative_to(self.root)} · 按每个文件原尺寸处理")
+            return
         self.summary.setText(
             f"模型  {model}    ·    模式  {backend_text}    ·    输出  {width}×{height}"
         )
@@ -586,23 +675,34 @@ class MainWindow(QMainWindow):
             self.weight_hint.setText(f"{state}    {relative_path}")
 
     def _choose_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择图像或视频",
-            "",
-            "媒体文件 (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp *.mp4 *.avi *.mov *.mkv *.m4v);;所有文件 (*)",
-        )
-        if not path:
+        """一个入口选择单文件或当前文件夹，保留主界面原来的按钮数量。"""
+        dialog = SourceDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.chosen_path:
             return
-        self.source = path
-        self.source_kind = "image" if Path(path).suffix.lower() in IMAGE_EXTENSIONS else "video"
-        source_label = "图像" if self.source_kind == "image" else "视频"
+        self._set_source_path(dialog.chosen_path)
+
+    def _set_source_path(self, path: str) -> None:
+        """识别输入类别；文件夹清单由工作线程扫描，避免界面读取大量文件。"""
+        selected = Path(path)
+        kind = "folder" if selected.is_dir() else media_kind(selected)
+        if kind is None or not selected.exists():
+            QMessageBox.warning(self, "输入不可用", "请选择存在的图像、视频或文件夹。")
+            return
+        self.source, self.source_kind = str(selected), kind
+        self._active_source_kind = kind
+        self._resolved_auto_size = None
+        self._sync_auto_option()
+        self._update_summary()
+        source_label = {"image": "图像", "video": "视频", "folder": "文件夹"}[kind]
         self.source_label.setText(f"{source_label}  ·  {path}")
-        self.source_label.setToolTip(str(path))
+        detail = str(path) + ("\n按文件名顺序处理当前目录的图像和视频，不递归子目录" if kind == "folder" else "")
+        self.source_label.setToolTip(detail)
 
     def _choose_camera(self) -> None:
         self.source = 0
         self.source_kind = "camera"
+        self._active_source_kind = "camera"
+        self._sync_auto_option()
         self.source_label.setText("实时摄像头  ·  Camera 0")
         self.source_label.setToolTip("开始增强时按处理尺寸自动协商采集模式")
 
@@ -626,6 +726,7 @@ class MainWindow(QMainWindow):
             self.save_checkbox,
             self.output_dir,
             self.output_button,
+            self.settings_button,
         )
         for widget in configurable_widgets:
             widget.setEnabled(not running)
@@ -642,7 +743,7 @@ class MainWindow(QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             return
         if self.source is None or self.source_kind is None:
-            QMessageBox.warning(self, "缺少输入", "请先选择图像、视频或摄像头。")
+            QMessageBox.warning(self, "缺少输入", "请先选择图像、视频、文件夹或摄像头。")
             return
         model_name = self.model_combo.currentText()
         if not model_name:
@@ -650,6 +751,9 @@ class MainWindow(QMainWindow):
             return
 
         key, width, height = self._current_size()
+        if key == "auto" and (self.backend_combo.currentData() != "pytorch" or self.source_kind == "camera"):
+            QMessageBox.warning(self, "自动匹配不可用", "自动匹配仅支持PyTorch图像、视频或文件夹；摄像头请选择固定尺寸。")
+            return
         if (
             key == "other"
             and self._confirmed_custom_size != (width, height)
@@ -684,6 +788,10 @@ class MainWindow(QMainWindow):
         )
         # 新任务允许正常显示帧；同时先清除上一次任务留下的画面。
         self._clear_previews_on_finish = False
+        self._active_source_kind = self.source_kind
+        self._resolved_auto_size = None
+        self._batch_errors.clear()
+        self.statusBar().setToolTip("")
         self._display_timer.stop()
         self._metrics_timer.stop()
         self._playback_active = False
@@ -704,6 +812,9 @@ class MainWindow(QMainWindow):
         self.worker.state_changed.connect(self._set_state)
         self.worker.camera_info.connect(self._show_camera_info)
         self.worker.camera_frame_available.connect(self._camera_frame_available)
+        self.worker.media_started.connect(self._on_media_started)
+        self.worker.media_skipped.connect(self._show_media_skipped)
+        self.worker.processing_size_changed.connect(self._show_processing_size)
         self.worker.error.connect(self._show_error)
         self.worker.output_saved.connect(self._show_saved)
         self.worker.finished.connect(self._worker_finished)
@@ -712,6 +823,34 @@ class MainWindow(QMainWindow):
         self._set_state("正在初始化…")
         self.worker.start()
         self._metrics_timer.start()
+
+    def _on_media_started(self, path: str, kind: str, index: int, total: int) -> None:
+        """切换文件夹条目：终止旧播放节奏，再确认新条目可开始生产。"""
+        if self.sender() is not self.worker or self.worker is None:
+            return
+        self._display_timer.stop()
+        self._playback_active = False
+        self._active_source_kind = kind
+        self._last_display_time = None
+        self._display_intervals.clear()
+        self._resolved_auto_size = None
+        for card, unit in ((self.inference_card, "ms"), (self.inference_fps_card, "FPS"), (self.total_fps_card, "FPS")):
+            card.clear_value(unit)
+        self.source_label.setText(f"文件夹 {index}/{total}  ·  {'图像' if kind == 'image' else '视频'}  ·  {Path(path).name}")
+        self.source_label.setToolTip(f"文件夹：{self.source}\n当前文件：{path}\n进度：{index}/{total}")
+        self._update_summary()
+        self.worker.acknowledge_item()
+
+    def _show_processing_size(self, width: int, height: int) -> None:
+        """只显示当前任务真实尺寸，不改写用户的启动默认值。"""
+        if self.sender() is self.worker:
+            self._resolved_auto_size = (width, height)
+            self._update_summary()
+
+    def _show_media_skipped(self, message: str) -> None:
+        """坏媒体逐项记录并继续，批处理结束后仍可在状态栏查看原因。"""
+        self._batch_errors.append(message)
+        self.statusBar().showMessage(f"已跳过：{message}", 10000)
 
     def _show_camera_info(self, info: CameraInfo | str) -> None:
         """主框保留中文字段的运行摘要，格式、缓存和回退诊断移到悬停详情。"""
@@ -733,7 +872,7 @@ class MainWindow(QMainWindow):
         elif self._playback_active:
             # 暂停持续时间不能计入相邻两张显示帧的间隔。
             self._last_display_time = None
-            if self.source_kind != "camera":
+            if self._active_source_kind == "video":
                 self._update_display_interval()
                 self._display_timer.start()
         self.pause_button.setText("▶  继续" if should_pause else "Ⅱ  暂停")
@@ -775,8 +914,11 @@ class MainWindow(QMainWindow):
         self.enhanced_view.set_frame(enhanced)
         # 单张图像可能在第一个200 ms定时器触发前就处理完成，因此在收到
         # 图像结果时主动读取一次性能快照，避免卡片始终显示“--”。
-        if self.source_kind == "image":
+        if self._active_source_kind == "image":
             self._show_metrics()
+            if self.source_kind == "folder" and self.worker is not None:
+                # 先让主线程复制完图像，再确认下一项，限制待处理图片信号数量。
+                QTimer.singleShot(0, self.worker.acknowledge_image)
 
     def _show_prebuffer_progress(self, current: int, target: int) -> None:
         if not self._playback_active and not self._clear_previews_on_finish:
@@ -799,7 +941,7 @@ class MainWindow(QMainWindow):
 
     def _update_display_interval(self) -> None:
         """仅调整视频节奏；相机无轮询定时器，也不套用视频低水位降速。"""
-        if self.worker is None or self.source_kind == "camera":
+        if self.worker is None or self._active_source_kind != "video":
             return
         target_fps = self.worker.recommended_display_fps()
         interval_ms = max(1, round(1000.0 / max(target_fps, 1.0)))
@@ -856,7 +998,7 @@ class MainWindow(QMainWindow):
 
         # 处理能力或缓冲水位发生变化时平滑调整消费速度；计时器最多每
         # 200 ms改一次，避免逐帧修改间隔造成新的抖动。
-        if self._playback_active and not self._playback_paused and self.source_kind != "camera":
+        if self._playback_active and not self._playback_paused and self._active_source_kind == "video":
             self._update_display_interval()
 
     def _set_state(self, state: str) -> None:
@@ -873,6 +1015,10 @@ class MainWindow(QMainWindow):
         self._metrics_timer.stop()
         self._playback_active = False
         self._set_controls_running(False)
+        if self._batch_errors:
+            details = "；".join(self._batch_errors)
+            self.statusBar().showMessage(f"本次跳过{len(self._batch_errors)}项：{details}")
+            self.statusBar().setToolTip(details)
         if ("正在结束" in self.status_badge.text()
                 or "正在等待摄像头驱动释放" in self.status_badge.text()):
             self._set_state("已结束")

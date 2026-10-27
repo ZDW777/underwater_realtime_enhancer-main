@@ -73,6 +73,9 @@ class ModelSpec:
     init_kwargs: dict[str, Any] = field(default_factory=dict)
     # 模型识别时确定范围，PyTorch 和 TensorRT 直接读取，不修改模型模块元数据。
     output_range: str = DEFAULT_OUTPUT_RANGE
+    # 仅 PyTorch 自动匹配使用：边缘补齐到该倍数，输出裁回原尺寸。
+    # 默认8兼容当前模型；更特殊的网络可在集中配置覆盖，无需修改网络代码。
+    input_multiple: int = 8
 
     def create(self):
         """使用识别出的主网络类和构造参数创建模型。"""
@@ -157,7 +160,7 @@ class ModelRegistry:
 
     @staticmethod
     def _validate_options(options: dict[str, Any]) -> None:
-        allowed = {"file", "class_name", "init_kwargs", "requires_weights", "output_range"}
+        allowed = {"file", "class_name", "init_kwargs", "requires_weights", "output_range", "input_multiple"}
         unknown = set(options) - allowed
         if unknown:
             raise ValueError(f"不支持的注册字段：{', '.join(sorted(unknown))}")
@@ -174,6 +177,15 @@ class ModelRegistry:
             raise TypeError("requires_weights 必须是 true 或 false")
         if "output_range" in options:
             normalize_output_range(options["output_range"])
+        if "input_multiple" in options:
+            ModelRegistry._validate_input_multiple(options["input_multiple"])
+
+    @staticmethod
+    def _validate_input_multiple(value: Any) -> int:
+        """拒绝布尔值、非整数与过大补边，避免自动匹配时误分配巨量显存。"""
+        if type(value) is not int or not 1 <= value <= 1024:
+            raise ValueError("input_multiple 必须是1至1024之间的整数")
+        return value
 
     @staticmethod
     def _find_constructor(module: ModuleType, file: Path, options: dict[str, Any]):
@@ -296,6 +308,9 @@ class ModelRegistry:
                     constructor=constructor,
                     init_kwargs=dict(options.get("init_kwargs", {})),
                     output_range=output_range,
+                    input_multiple=self._validate_input_multiple(
+                        options.get("input_multiple", getattr(module, "INPUT_MULTIPLE", 8))
+                    ),
                 )
             except Exception as exc:
                 # 保存详细错误供状态栏显示，同时继续扫描下一个文件。
